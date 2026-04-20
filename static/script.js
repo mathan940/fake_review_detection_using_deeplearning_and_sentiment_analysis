@@ -205,7 +205,7 @@
             },
             options: {
                 responsive: true,
-                maintainAspectRatio: true,
+                maintainAspectRatio: false,
                 animation: {
                     duration: 1200,
                     easing: "easeOutQuart",

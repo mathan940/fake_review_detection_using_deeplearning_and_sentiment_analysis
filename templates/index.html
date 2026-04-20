@@ -16,8 +16,51 @@
 
     <!-- App styles -->
     <link rel="stylesheet" href="/static/style.css" />
+    <style>
+        .navbar {
+            position: relative; z-index: 10;
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 1rem 2rem;
+            background: rgba(20,23,40,0.85);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid rgba(255,255,255,0.08);
+        }
+        .nav-brand { display: flex; align-items: center; gap: 0.6rem; text-decoration: none; }
+        .nav-logo  { font-size: 1.4rem; }
+        .nav-title { font-size: 1.1rem; font-weight: 700; color: #e2e8f0; }
+        .nav-title span { color: #a78bfa; }
+        .nav-links { display: flex; gap: 1rem; }
+        .nav-links a {
+            text-decoration: none; color: #94a3b8; font-size: 0.88rem; font-weight: 500;
+            padding: 0.4rem 0.9rem; border-radius: 8px; transition: all 0.2s;
+        }
+        .nav-links a:hover, .nav-links a.active {
+            color: #e2e8f0; background: rgba(124,107,251,0.15);
+        }
+        .dataset-badge {
+            display: inline-flex; align-items: center; gap: 0.3rem;
+            background: linear-gradient(135deg,#7c6bfb22,#a78bfa22);
+            border: 1px solid rgba(124,107,251,0.3);
+            border-radius: 20px; padding: 0.25rem 0.75rem;
+            font-size: 0.78rem; font-weight: 600; color: #a78bfa;
+            text-decoration: none; transition: all 0.2s;
+        }
+        .dataset-badge:hover { background: rgba(124,107,251,0.25); }
+    </style>
 </head>
 <body>
+
+    <!-- ── Navbar ── -->
+    <nav class="navbar">
+        <a href="/" class="nav-brand">
+            <span class="nav-logo">🛡️</span>
+            <span class="nav-title">ReviewGuard <span>AI</span></span>
+        </a>
+        <div class="nav-links">
+            <a href="/" class="active">Analyzer</a>
+            <a href="/dataset" class="dataset-badge">📊 Dataset Explorer</a>
+        </div>
+    </nav>
 
     <!-- ── Animated background blobs ── -->
     <div class="bg-blobs" aria-hidden="true">
@@ -111,7 +154,7 @@
     </main>
 
     <footer class="app-footer">
-        <p>Built with Flask · TensorFlow · LSTM · Chart.js</p>
+        <p>Built with Flask · Scikit-learn · TF-IDF · Chart.js &nbsp;|&nbsp; <a href="/dataset" style="color:#a78bfa;text-decoration:none;">📊 Explore Dataset</a></p>
     </footer>
 
     <!-- App logic -->

@@ -17,10 +17,13 @@ build/
 *.egg-info/
 *.egg
 
-# ML model files (if large, add them separately via Git LFS)
+# ML model files (large binary files — retrain locally)
+models/
 *.h5
 *.pkl
+*.keras
 *.model
+*.weights
 
 # Environment variables
 .env
@@ -35,3 +38,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Flask instance
+instance/

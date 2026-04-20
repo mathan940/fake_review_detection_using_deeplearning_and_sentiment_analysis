@@ -1,223 +1,250 @@
 """
 Sentiment Analysis & Fake Review Detection — Flask Backend
-Uses TF-IDF + Logistic Regression for fast, reliable classification.
-Combined with heuristic rules for improved fake-review detection.
+Algorithm : Bidirectional LSTM + Word Embeddings (Deep Learning)
+Dataset   : 12,000 labeled reviews from CSV
+Cache     : Trained models saved to disk — fast restarts after first run.
 """
 
-import os
-import re
+import os, csv, re, pickle, logging
 import numpy as np
 import mysql.connector
 from collections import Counter
 
+# ── Suppress verbose TF logs ──────────────────────────────────────────────────
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+
 from flask import Flask, render_template, request, jsonify
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import (
+    Embedding, Bidirectional, LSTM, Dense, Dropout, GlobalMaxPooling1D
+)
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.callbacks import EarlyStopping
 
 app = Flask(__name__)
 
-# ─── Database Configuration ──────────────────────────────────────────────────
+# ─── Hyper-parameters ─────────────────────────────────────────────────────────
+MAX_WORDS     = 12000   # vocabulary size
+MAX_LEN       = 120     # max tokens per review
+EMBEDDING_DIM = 64      # word vector size
+LSTM_UNITS    = 64      # LSTM hidden units
+EPOCHS        = 15
+BATCH_SIZE    = 32
+
+# ─── Model cache paths ─────────────────────────────────────────────────────────
+MODEL_DIR           = os.path.join(os.path.dirname(__file__), 'models')
+SENT_MODEL_PATH     = os.path.join(MODEL_DIR, 'sentiment_lstm.keras')
+FAKE_MODEL_PATH     = os.path.join(MODEL_DIR, 'fake_lstm.keras')
+TOKENIZER_PATH      = os.path.join(MODEL_DIR, 'tokenizer.pkl')
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+# ─── Database Configuration ────────────────────────────────────────────────────
 DB_CONFIG = {
-    'host': 'localhost',
-    'user': 'root',
+    'host':     'localhost',
+    'user':     'root',
     'password': 'mathanmani@123',
     'database': 'fake_review_db'
 }
 
 def get_db_connection():
     try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        return conn
+        return mysql.connector.connect(**DB_CONFIG)
     except mysql.connector.Error as err:
-        print(f"Database Error: {err}")
+        print(f"[DB-ERROR] {err}")
         return None
 
-# ─── Sample Training Data ────────────────────────────────────────────────────
-# Sentiment labels:  0 = Negative, 1 = Neutral, 2 = Positive
-sentiment_texts = [
-    # Positive
-    "This product is absolutely amazing and I love it",
-    "Wonderful quality and fast shipping, highly recommend",
-    "Best purchase I have ever made, exceeded expectations",
-    "Fantastic experience, will definitely buy again",
-    "Great value for money, works perfectly",
-    "I am very happy with this purchase, five stars",
-    "Excellent product, exactly as described",
-    "Super impressed with the quality and durability",
-    "Outstanding service and product quality",
-    "Love this item, it works like a charm",
-    "Incredible build quality, worth every penny",
-    "Very satisfied customer here, amazing product",
-    "Perfect gift, my friend loved it",
-    "Top notch quality, fast delivery, great seller",
-    "This made my life so much easier, thank you",
+# ─── Load CSV Dataset ──────────────────────────────────────────────────────────
+CSV_PATH = os.path.join(os.path.dirname(__file__), 'reviews (1).csv')
 
-    # Negative
-    "Terrible product, broke after one day of use",
-    "Waste of money, do not buy this garbage",
-    "Awful quality, feels cheap and flimsy",
-    "Worst purchase ever, completely disappointed",
-    "Product stopped working after a week, very bad",
-    "Horrible experience, took forever to arrive and was damaged",
-    "Do not recommend, customer service was unhelpful",
-    "Very poor quality, nothing like the pictures",
-    "Regret buying this, total waste of money",
-    "Extremely disappointed, product is defective",
-    "Broke immediately, cheapest materials ever used",
-    "Unusable product, arrived broken and scratched",
-    "Scam product, looks nothing like advertised",
-    "Terrible build quality, falls apart easily",
-    "Would give zero stars if I could",
+_sent_map = {'Negative': 0, 'Neutral': 1, 'Positive': 2}
+_fake_map  = {'Genuine': 0, 'Fake': 1}
 
-    # Neutral
-    "The product is okay, nothing special",
-    "Average quality, does what it says",
-    "It is fine for the price, not great not bad",
-    "Decent product, meets basic expectations",
-    "Works as expected, nothing remarkable",
-    "Standard quality, you get what you pay for",
-    "It is alright, could be better could be worse",
-    "Mediocre product, serves its purpose",
-    "Not bad but not impressive either",
-    "Fair quality for the price point",
-    "Acceptable product, no complaints no praise",
-    "Middle of the road, does the job",
-]
+sentiment_texts, sentiment_labels = [], []
+fake_texts,      fake_labels      = [], []
+ALL_REVIEWS = []
 
-sentiment_labels = (
-    [2]*15 +   # Positive
-    [0]*15 +   # Negative
-    [1]*12     # Neutral
-)
+print("[*] Loading CSV dataset...")
+try:
+    with open(CSV_PATH, encoding='utf-8', errors='ignore') as f:
+        for row in csv.DictReader(f):
+            review = row.get('review', '').strip()
+            label  = row.get('label',  '').strip()
+            sent   = row.get('sentiment', '').strip()
+            if not review:
+                continue
+            ALL_REVIEWS.append({'review': review, 'label': label, 'sentiment': sent})
+            if sent in _sent_map:
+                sentiment_texts.append(review)
+                sentiment_labels.append(_sent_map[sent])
+            if label in _fake_map:
+                fake_texts.append(review)
+                fake_labels.append(_fake_map[label])
+    print(f"[OK] Loaded {len(ALL_REVIEWS)} reviews "
+          f"| Sentiment: {len(sentiment_texts)} | Fake: {len(fake_texts)}")
+except FileNotFoundError:
+    print(f"[WARN] CSV not found — using minimal fallback data")
+    sentiment_texts  = ["great product", "terrible product", "okay product"]
+    sentiment_labels = [2, 0, 1]
+    fake_texts  = ["nice buy", "BUY NOW BUY NOW!!!"]
+    fake_labels = [0, 1]
 
-# Fake labels: 0 = Genuine, 1 = Fake
-fake_texts = [
-    # Genuine reviews
-    "I bought this for my kitchen and it works well for daily use",
-    "Good product but the delivery was a bit slow",
-    "The quality is decent for this price range",
-    "Used it for three months now, still going strong",
-    "Nice product, though the color is slightly different from photo",
-    "My daughter loves this toy, good quality plastic",
-    "Works fine for basic tasks, battery life is average",
-    "Solid build quality, heavier than expected",
-    "Pretty good value, I would buy again at this price",
-    "Arrived on time, packaging was good, product as expected",
-    "After two weeks of use I can say it is reliable",
-    "Decent quality, instructions could be clearer though",
-    "Good for the price but don't expect premium quality",
-    "My second purchase from this brand, consistent quality",
-    "Fits perfectly, material feels comfortable",
 
-    # Fake reviews
-    "BEST PRODUCT EVER!!! BUY NOW!!! AMAZING AMAZING AMAZING!!!",
-    "This is the greatest thing in the world you must buy it now",
-    "Five stars five stars five stars absolutely perfect no flaws",
-    "OMG this changed my life completely buy buy buy!!!",
-    "Perfect perfect perfect I bought 50 of these amazing",
-    "Greatest product on earth, nothing compares, buy immediately",
-    "THIS IS AMAZING BUY IT NOW BEST DEAL EVER WOW WOW WOW",
-    "I love it so much I bought one for everyone I know best ever",
-    "Totally real review this product is the best in the universe",
-    "Cannot believe how amazing this is, life changing purchase!!!",
-    "Everyone should buy this right now, 100 percent perfect!!!",
-    "asdf great product asdf would recommend asdf",
-    "best best best best best best best best best product",
-    "Seller asked me to leave five stars so here it is great product",
-    "Got a discount for this review but the product is genuinely great",
-]
+# ─── Text Preprocessing ────────────────────────────────────────────────────────
+def clean_text(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s!?]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
-fake_labels = [0]*15 + [1]*15
+all_texts_clean = [clean_text(t) for t in sentiment_texts + fake_texts]
 
-# ─── Train Models (fast: TF-IDF + Logistic Regression) ───────────────────────
 
-print("[*] Training Sentiment model...")
-sentiment_pipeline = Pipeline([
-    ('tfidf', TfidfVectorizer(ngram_range=(1, 2), max_features=5000)),
-    ('clf', LogisticRegression(max_iter=500, C=1.0, solver='lbfgs')),
-])
-sentiment_pipeline.fit(sentiment_texts, sentiment_labels)
-print("[OK] Sentiment model ready")
+# ─── Build / Load Tokenizer ────────────────────────────────────────────────────
+if os.path.exists(TOKENIZER_PATH):
+    print("[*] Loading tokenizer from cache...")
+    with open(TOKENIZER_PATH, 'rb') as f:
+        tokenizer = pickle.load(f)
+    print("[OK] Tokenizer loaded")
+else:
+    print("[*] Building tokenizer...")
+    tokenizer = Tokenizer(num_words=MAX_WORDS, oov_token='<OOV>')
+    tokenizer.fit_on_texts(all_texts_clean)
+    with open(TOKENIZER_PATH, 'wb') as f:
+        pickle.dump(tokenizer, f)
+    print(f"[OK] Tokenizer built — vocab size: {len(tokenizer.word_index)}")
 
-print("[*] Training Fake-Review model...")
-fake_pipeline = Pipeline([
-    ('tfidf', TfidfVectorizer(ngram_range=(1, 2), max_features=5000)),
-    ('clf', LogisticRegression(max_iter=500, C=1.0, solver='lbfgs')),
-])
-fake_pipeline.fit(fake_texts, fake_labels)
-print("[OK] Fake-review model ready")
 
-# ─── Heuristic Helpers ───────────────────────────────────────────────────────
+def texts_to_padded(texts):
+    cleaned = [clean_text(t) for t in texts]
+    seqs    = tokenizer.texts_to_sequences(cleaned)
+    return pad_sequences(seqs, maxlen=MAX_LEN, padding='post', truncating='post')
 
+
+# ─── LSTM Architecture Builder ─────────────────────────────────────────────────
+def build_lstm_model(num_classes: int) -> tf.keras.Model:
+    """
+    Bidirectional LSTM model:
+      Embedding → BiLSTM → GlobalMaxPool → Dropout → Dense → Output
+    """
+    model = Sequential([
+        Embedding(MAX_WORDS, EMBEDDING_DIM, input_length=MAX_LEN),
+        Bidirectional(LSTM(LSTM_UNITS, return_sequences=True)),
+        GlobalMaxPooling1D(),
+        Dropout(0.4),
+        Dense(64, activation='relu'),
+        Dropout(0.3),
+        Dense(num_classes,
+              activation='softmax' if num_classes > 1 else 'sigmoid'),
+    ])
+    loss = 'categorical_crossentropy' if num_classes > 1 else 'binary_crossentropy'
+    model.compile(optimizer='adam', loss=loss, metrics=['accuracy'])
+    return model
+
+
+early_stop = EarlyStopping(monitor='val_loss', patience=3,
+                            restore_best_weights=True, verbose=0)
+
+
+# ─── Sentiment LSTM ────────────────────────────────────────────────────────────
+if os.path.exists(SENT_MODEL_PATH):
+    print("[*] Loading Sentiment LSTM from cache...")
+    sentiment_model = load_model(SENT_MODEL_PATH)
+    print("[OK] Sentiment LSTM loaded")
+else:
+    print("[*] Training Sentiment LSTM (Bidirectional) — this may take a few minutes...")
+    X_sent = texts_to_padded(sentiment_texts)
+    y_sent = to_categorical(sentiment_labels, num_classes=3)
+
+    sentiment_model = build_lstm_model(num_classes=3)
+    sentiment_model.fit(
+        X_sent, y_sent,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_split=0.1,
+        callbacks=[early_stop],
+        verbose=1,
+    )
+    sentiment_model.save(SENT_MODEL_PATH)
+    print("[OK] Sentiment LSTM trained & saved")
+
+
+# ─── Fake-Detection LSTM ───────────────────────────────────────────────────────
+if os.path.exists(FAKE_MODEL_PATH):
+    print("[*] Loading Fake-Detection LSTM from cache...")
+    fake_model = load_model(FAKE_MODEL_PATH)
+    print("[OK] Fake-Detection LSTM loaded")
+else:
+    print("[*] Training Fake-Detection LSTM (Bidirectional) — this may take a few minutes...")
+    X_fake = texts_to_padded(fake_texts)
+    y_fake = to_categorical(fake_labels, num_classes=2)
+
+    fake_model = build_lstm_model(num_classes=2)
+    fake_model.fit(
+        X_fake, y_fake,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_split=0.1,
+        callbacks=[early_stop],
+        verbose=1,
+    )
+    fake_model.save(FAKE_MODEL_PATH)
+    print("[OK] Fake-Detection LSTM trained & saved")
+
+
+# ─── Heuristic Fake Signals ────────────────────────────────────────────────────
 def _has_repetition(text: str) -> bool:
     words = text.lower().split()
     if len(words) < 4:
         return False
     counts = Counter(words)
-    most_common_count = counts.most_common(1)[0][1]
-    return most_common_count / len(words) > 0.4
+    return counts.most_common(1)[0][1] / len(words) > 0.4
 
 FAKE_SIGNALS = {
-    "excessive_caps": (
-        lambda t: sum(1 for c in t if c.isupper()) / max(len(t), 1) > 0.5,
-        "Excessive use of capital letters",
-    ),
-    "excessive_exclamation": (
-        lambda t: t.count("!") > 3,
-        "Excessive exclamation marks",
-    ),
-    "repetitive_words": (
-        lambda t: _has_repetition(t),
-        "Highly repetitive language",
-    ),
-    "very_short": (
-        lambda t: len(t.split()) < 4,
-        "Review is suspiciously short",
-    ),
-    "buy_now_pressure": (
-        lambda t: any(p in t.lower() for p in ["buy now", "buy it now", "buy immediately", "must buy"]),
-        "Contains aggressive purchase pressure language",
-    ),
-    "incentivised": (
-        lambda t: any(p in t.lower() for p in ["discount for review", "free product", "asked me to leave"]),
-        "Appears to be an incentivised review",
-    ),
+    "excessive_caps":        (lambda t: sum(1 for c in t if c.isupper()) / max(len(t), 1) > 0.5,
+                              "Excessive use of capital letters"),
+    "excessive_exclamation": (lambda t: t.count("!") > 3,
+                              "Excessive exclamation marks"),
+    "repetitive_words":      (lambda t: _has_repetition(t),
+                              "Highly repetitive language"),
+    "very_short":            (lambda t: len(t.split()) < 4,
+                              "Review is suspiciously short"),
+    "buy_now_pressure":      (lambda t: any(p in t.lower() for p in
+                              ["buy now", "buy it now", "buy immediately", "must buy"]),
+                              "Contains aggressive purchase pressure language"),
+    "incentivised":          (lambda t: any(p in t.lower() for p in
+                              ["discount for review", "free product", "asked me to leave"]),
+                              "Appears to be an incentivised review"),
 }
 
-
 def heuristic_fake_score(text: str):
-    """Return (fake_probability_boost, list_of_reasons)."""
-    reasons = []
-    score = 0.0
-    for _key, (test_fn, reason) in FAKE_SIGNALS.items():
-        if test_fn(text):
+    reasons, score = [], 0.0
+    for _, (fn, reason) in FAKE_SIGNALS.items():
+        if fn(text):
             reasons.append(reason)
             score += 0.15
     return min(score, 0.6), reasons
 
 
-# ─── Sentiment → Star mapping ────────────────────────────────────────────────
-
-def confidence_to_stars(pos_conf: float, neg_conf: float, neu_conf: float) -> float:
-    """Map sentiment confidence values to a 1-5 star rating."""
-    raw = pos_conf * 5.0 + neu_conf * 3.0 + neg_conf * 1.0
+# ─── Helper Functions ──────────────────────────────────────────────────────────
+def confidence_to_stars(pos: float, neg: float, neu: float) -> float:
+    raw = pos * 5.0 + neu * 3.0 + neg * 1.0
     return round(max(1.0, min(5.0, raw)), 1)
 
-
 def sentiment_reason(label: str, confidence: float) -> str:
-    """Generate a short human-readable explanation."""
     strength = "strongly" if confidence > 0.80 else "moderately" if confidence > 0.55 else "slightly"
     if label == "Positive":
         return f"The review expresses {strength} positive sentiment with favorable language and tone."
     elif label == "Negative":
         return f"The review expresses {strength} negative sentiment indicating dissatisfaction."
-    else:
-        return f"The review is {strength} neutral, expressing neither strong praise nor criticism."
+    return f"The review is {strength} neutral, expressing neither strong praise nor criticism."
 
 
-# ─── Routes ──────────────────────────────────────────────────────────────────
-
+# ─── Routes ───────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -230,90 +257,130 @@ def analyze():
     if not text:
         return jsonify({"error": "Review text is required."}), 400
 
-    # ── Sentiment prediction ──
-    sent_proba = sentiment_pipeline.predict_proba([text])[0]
-    # Classes order from pipeline: 0=Negative, 1=Neutral, 2=Positive
-    classes = list(sentiment_pipeline.classes_)
-    neg_conf = float(sent_proba[classes.index(0)])
-    neu_conf = float(sent_proba[classes.index(1)])
-    pos_conf = float(sent_proba[classes.index(2)])
+    padded = texts_to_padded([text])
 
-    sent_idx = int(np.argmax(sent_proba))
-    sent_label = ["Negative", "Neutral", "Positive"][classes[sent_idx]]
+    # ── Sentiment LSTM prediction ──────────────────────────────────────────
+    sent_proba = sentiment_model.predict(padded, verbose=0)[0]
+    # Index order matches label encoding: 0=Negative, 1=Neutral, 2=Positive
+    neg_conf = float(sent_proba[0])
+    neu_conf = float(sent_proba[1])
+    pos_conf = float(sent_proba[2])
+
+    sent_idx       = int(np.argmax(sent_proba))
+    sent_label     = ["Negative", "Neutral", "Positive"][sent_idx]
     sent_confidence = float(sent_proba[sent_idx])
 
-    # ── Fake detection (ML) ──
-    fake_proba = fake_pipeline.predict_proba([text])[0]
-    fake_classes = list(fake_pipeline.classes_)
-    dl_genuine_conf = float(fake_proba[fake_classes.index(0)])
-    dl_fake_conf = float(fake_proba[fake_classes.index(1)])
+    # ── Fake-Detection LSTM prediction ────────────────────────────────────
+    fake_proba       = fake_model.predict(padded, verbose=0)[0]
+    dl_genuine_conf  = float(fake_proba[0])
+    dl_fake_conf     = float(fake_proba[1])
 
-    # ── Fake detection (heuristic boost) ──
-    h_boost, h_reasons = heuristic_fake_score(text)
-    combined_fake_conf = min(dl_fake_conf + h_boost, 1.0)
-    combined_genuine_conf = max(1.0 - combined_fake_conf, 0.0)
+    # ── Heuristic boost ────────────────────────────────────────────────────
+    h_boost, h_reasons      = heuristic_fake_score(text)
+    combined_fake_conf      = min(dl_fake_conf + h_boost, 1.0)
+    combined_genuine_conf   = max(1.0 - combined_fake_conf, 0.0)
 
-    is_fake = combined_fake_conf > 0.5
-    fake_label = "Fake" if is_fake else "Genuine"
+    is_fake        = combined_fake_conf > 0.5
+    fake_label     = "Fake" if is_fake else "Genuine"
     fake_confidence = combined_fake_conf if is_fake else combined_genuine_conf
 
-    # ── Fake reason ──
     if is_fake:
-        if h_reasons:
-            fake_reason = "Flagged as potentially fake: " + "; ".join(h_reasons) + "."
-        else:
-            fake_reason = "The model detected patterns commonly seen in fake reviews."
+        fake_reason = ("Flagged as potentially fake: " + "; ".join(h_reasons) + "."
+                       if h_reasons
+                       else "The LSTM model detected patterns commonly seen in fake reviews.")
     else:
         fake_reason = "The review appears authentic with natural language patterns and specific details."
 
-    # ── Star rating ──
     stars = confidence_to_stars(pos_conf, neg_conf, neu_conf)
 
-    # ── Database insertion ──
+    # ── Database insertion ─────────────────────────────────────────────────
     try:
         conn = get_db_connection()
         if conn:
             cursor = conn.cursor()
-            sql = """
-                INSERT INTO reviews 
-                (review_text, sentiment_label, sentiment_confidence, fake_label, fake_confidence, stars)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """
-            val = (text, sent_label, float(sent_confidence), fake_label, float(fake_confidence), float(stars))
-            cursor.execute(sql, val)
+            cursor.execute(
+                """INSERT INTO reviews
+                   (review_text, sentiment_label, sentiment_confidence,
+                    fake_label, fake_confidence, stars)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (text, sent_label, float(sent_confidence),
+                 fake_label, float(fake_confidence), float(stars))
+            )
             conn.commit()
             cursor.close()
             conn.close()
-            print("[INFO] Review stored in database successfully.")
-        else:
-            print("[WARN] Could not connect to database, review not stored.")
     except Exception as e:
-        print(f"[ERROR] Failed to insert into database: {e}")
+        print(f"[DB-ERROR] {e}")
 
     return jsonify({
         "sentiment": {
-            "label": sent_label,
+            "label":      sent_label,
             "confidence": round(sent_confidence * 100, 2),
-            "reason": sentiment_reason(sent_label, sent_confidence),
+            "reason":     sentiment_reason(sent_label, sent_confidence),
         },
         "fake_detection": {
-            "label": fake_label,
+            "label":      fake_label,
             "confidence": round(fake_confidence * 100, 2),
-            "reason": fake_reason,
+            "reason":     fake_reason,
         },
         "scores": {
             "positive": round(pos_conf * 100, 2),
             "negative": round(neg_conf * 100, 2),
-            "neutral": round(neu_conf * 100, 2),
-            "fake": round(combined_fake_conf * 100, 2),
-            "genuine": round(combined_genuine_conf * 100, 2),
+            "neutral":  round(neu_conf * 100, 2),
+            "fake":     round(combined_fake_conf * 100, 2),
+            "genuine":  round(combined_genuine_conf * 100, 2),
         },
         "stars": stars,
     })
 
 
-# ─── Entry Point ─────────────────────────────────────────────────────────────
+# ─── Dataset Routes ────────────────────────────────────────────────────────────
+@app.route("/dataset")
+def dataset_page():
+    return render_template("dataset.html")
 
+
+@app.route("/api/dataset")
+def api_dataset():
+    page     = max(int(request.args.get('page', 1)), 1)
+    per_page = min(int(request.args.get('per_page', 20)), 100)
+    search   = request.args.get('search', '').lower().strip()
+    label_f  = request.args.get('label', '').strip()
+    sent_f   = request.args.get('sentiment', '').strip()
+
+    filtered = ALL_REVIEWS
+    if search:
+        filtered = [r for r in filtered if search in r['review'].lower()]
+    if label_f:
+        filtered = [r for r in filtered if r['label'] == label_f]
+    if sent_f:
+        filtered = [r for r in filtered if r['sentiment'] == sent_f]
+
+    total = len(filtered)
+    rows  = filtered[(page-1)*per_page : page*per_page]
+
+    return jsonify({
+        'total':    total,
+        'page':     page,
+        'per_page': per_page,
+        'pages':    max(1, -(-total // per_page)),
+        'reviews':  rows,
+    })
+
+
+@app.route("/api/dataset-stats")
+def api_dataset_stats():
+    return jsonify({
+        'total':    len(ALL_REVIEWS),
+        'genuine':  sum(1 for r in ALL_REVIEWS if r['label']     == 'Genuine'),
+        'fake':     sum(1 for r in ALL_REVIEWS if r['label']     == 'Fake'),
+        'positive': sum(1 for r in ALL_REVIEWS if r['sentiment'] == 'Positive'),
+        'negative': sum(1 for r in ALL_REVIEWS if r['sentiment'] == 'Negative'),
+        'neutral':  sum(1 for r in ALL_REVIEWS if r['sentiment'] == 'Neutral'),
+    })
+
+
+# ─── Entry Point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("\n>>> Server running at http://127.0.0.1:5000\n")
     app.run(debug=False, port=5000)

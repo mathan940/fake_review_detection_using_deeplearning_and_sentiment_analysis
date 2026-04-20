@@ -404,7 +404,7 @@ body {
 .chart-container {
     position: relative;
     width: 100%;
-    max-height: 320px;
+    height: 300px;
 }
 
 /* ── Footer ────────────────────────────────────────────────────────────── */
