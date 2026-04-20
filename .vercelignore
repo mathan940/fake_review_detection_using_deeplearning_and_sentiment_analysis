@@ -1,0 +1,19 @@
+# Exclude virtual environment (Vercel installs its own from requirements.txt)
+.venv/
+venv/
+env/
+
+# Exclude large model cache files (models are retrained on first run)
+models/
+
+# Exclude dataset CSV
+reviews (1).csv
+
+# Exclude git history and misc
+.git/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdf
+test_db.py
